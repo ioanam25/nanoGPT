@@ -10,3 +10,16 @@ __pycache__/
 input.txt
 env/
 venv/
+data/
+out*
+slurm/
+wandb/
+*.npy
+icl*
+images/
+no_thinking/
+thinking/
+samples_csv/
+sources_10k/
+results*
+

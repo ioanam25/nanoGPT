@@ -26,12 +26,18 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-
+import random
+import json
 from model import GPTConfig, GPT
+from pathlib import Path
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
+curr_source = 4
+no_thinking = 0
+thinking = 0
+long_thinking = 0
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
@@ -110,19 +116,125 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+train_batch_index = 0
+
+# tokenizer
+meta_path = 'data/arc/meta.pkl'
+print(f"Loading meta from {meta_path}...")
+with open(meta_path, 'rb') as f:
+    meta = pickle.load(f)
+stoi, itos = meta['stoi'], meta['itos']
+encode = lambda s: [stoi[c] for c in s]
+decode = lambda l: ''.join([itos[i] for i in l])
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+import random
+import numpy as np
+import torch
+from typing import Dict, Any, Iterator, Optional, TypedDict
+
+def sources_split(root_dir: str):
+    random.seed(10)
+    subdirs = []
+    for subdir in Path(root_dir).iterdir():
+        if not subdir.is_dir():
+            continue
+        chunk_files = list(subdir.glob("*.chunk.*.jsonl"))
+        if chunk_files:
+            subdirs.append(str(chunk_files[0]))
+
+    train_indices = random.sample(range(400), 350)
+    val_indices = [i for i in range(400) if i not in train_indices]
+
+    train_sources = [subdirs[i] for i in train_indices]
+    val_sources = [subdirs[i] for i in val_indices]
+    random.seed(None)
+
+    return train_sources, val_sources
+
+train_sources, val_sources = sources_split("/gpfs/data/oermannlab/users/im2178/nanoGPT/sources_10k")
+# print(train_sources, val_sources)
+
+def read_jsonl_block(file_path: str):
+    """Read all lines from a JSONL file into memory."""
+    with open(file_path, "r") as file:
+        return [json.loads(line) for line in file]
+
+def sample_and_combine_lines(lines: list, rng: np.random.Generator) -> dict:
+    """Sample 3 random lines and combine their text/content."""
+    random_num = rng.integers(0, 800)
+    if random_num < 160:
+        num_lines = 4
+    elif random_num < 160 + 450:
+        num_lines = 3
+    elif random_num < 160 + 450 + 40:
+        num_lines = 5
     else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+        num_lines = 2
+    sampled_lines = rng.choice(lines, size=num_lines, replace=False)
+    combined_text = "B" # B is begin training symbol
+    for line in sampled_lines:
+        content_key = "text" if "text" in line else "content"
+        combined_text += line[content_key] 
+    return combined_text + "ET" # E is end training, T is begin testing
+
+
+def get_batch(split):
+    # print("in get batch")
+    if split == 'train':
+        sources = train_sources # random.choice(train_sources)
+        source = sources[curr_source]
+        lines = read_jsonl_block(source)[:9000]
+    else:
+        sources = train_sources # random.choice(val_sources)
+        source = sources[curr_source]
+        lines = read_jsonl_block(source)[9000:]
+    # source = sources[0] # random.choice(sources)
+    # print("SOURCE", source)
+    # lines = read_jsonl_block(source)
+    rng = np.random.default_rng()
+    ans_lines = rng.choice(lines, size=batch_size, replace=False) #random.randint(1000, (batch_size, ))
+    x = []
+    y = []
+    # print("we have ans lines", len(ans_lines))
+    # print(block_size)
+    for line in ans_lines: # we fill batch
+        full_task = 'P' * (block_size + 1)
+        while len(full_task) > block_size:
+            # print("enter while 1")
+            prompt_lines = sample_and_combine_lines(lines, rng) 
+            if no_thinking:
+                full_task = prompt_lines + line["text"] + 'F'
+            elif thinking:
+                full_task = prompt_lines + 't' * (int)(np.log(len(prompt_lines))) + line["text"] + 'F'
+            elif long_thinking:
+                full_task = prompt_lines + 't' * (len(prompt_lines) // 3) + line["text"] + 'F'
+            # print(len(full_task))
+
+        # print("exit while 1")
+        # print("full task before padding", full_task)
+        while len(full_task) < block_size:
+            # print("enter while 2")
+            full_task += 'P'
+        # print(print("exit while 2"))
+        x.append(torch.tensor(encode(full_task))) # x = ....ansPPPP y = PPPPansPPP
+        # print(line['text'])
+        if no_thinking:
+            target = 'P' * (len(prompt_lines) - 1 ) + line['text'] + 'F'
+        elif thinking:
+            target = 'P' * (len(prompt_lines) - 1 + (int)(np.log(len(prompt_lines)))) + line['text'] + 'F'
+        elif long_thinking:
+            target = 'P' * (len(prompt_lines) - 1 + (len(prompt_lines) // 3)) + line['text'] + 'F'
+        # print("target before padding", target)
+        while len(target) < block_size:
+            target += 'P'
+        y.append(torch.tensor(encode(target)))
+    
+    # print("time to stack")
+    x = torch.stack(x)
+    y = torch.stack(y)
+    # print(x.shape, y.shape)
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -131,8 +243,8 @@ def get_batch(split):
     return x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
-iter_num = 0
-best_val_loss = 1e9
+iter_num = 0 # 0
+best_val_loss = 1e9 #1e9
 
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -158,7 +270,7 @@ if init_from == 'scratch':
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(out_dir, 'ckpt_39000.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
@@ -218,8 +330,11 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        # print("eval iters", eval_iters)
         for k in range(eval_iters):
+            # print(k)
             X, Y = get_batch(split)
+            # print('batch', X, Y)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
@@ -246,12 +361,20 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+early_stopping_patience = 10  # Number of steps to wait for improvement
+early_stopping_min_delta = 1e-3  # Minimum change in loss to count as an improvement
+early_stopping_counter = 0  # Counter to track how many steps since last improvement
+
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
+print("batch shapes", X.shape, Y.shape)
+print('batch', X, Y)
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+train_losses = []
+val_losses = []
 while True:
 
     # determine and set the learning rate for this iteration
@@ -261,7 +384,10 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
+        # print("in eval")
         losses = estimate_loss()
+        # print("estimated loss")
+        # print(losses)
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
@@ -271,22 +397,44 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-    if iter_num == 0 and eval_only:
-        break
+        print(f"Iter: {iter_num}, "
+          f"Train Loss: {losses['train']:.4f}, "
+          f"Val Loss: {losses['val']:.4f}, "
+          f"Learning Rate: {lr:.6e}, "
+          f"MFU: {running_mfu * 100:.2f}%")
+        
+        train_loss = losses['train']
+        val_loss = losses['val']
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        if val_loss < best_val_loss - early_stopping_min_delta:
+            best_val_loss = val_loss
+            early_stopping_counter = 0 
 
+            if val_loss < best_val_loss or always_save_checkpoint:
+                if iter_num > 0:
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'config': config,
+                    }
+                    print(f"saving checkpoint to {out_dir}")
+                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt_' + str(iter_num) + '.pt'))
+                    print(best_val_loss, iter_num)
+        else:
+            early_stopping_counter += 1
+        if early_stopping_counter >= early_stopping_patience:
+            print(f"Early stopping triggered at iteration {iter_num} due to no improvement in validation loss.")
+            np.save(out_dir + '/train_losses.npy', train_losses)
+            np.save(out_dir + '/val_losses.npy', val_losses)
+            break
+    if iter_num == 0 and eval_only:
+        np.save(out_dir + '/train_losses.npy', train_losses)
+        np.save(out_dir + '/val_losses.npy', val_losses)
+        break
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
@@ -300,7 +448,11 @@ while True:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
+        # print('in training')
+        train_batch_index += batch_size  # Increment the batch counter
+        # print(train_batch_index/batch_size)
         X, Y = get_batch('train')
+        # print('batch', X, Y)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
