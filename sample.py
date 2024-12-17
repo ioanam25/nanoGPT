@@ -18,8 +18,8 @@ from pathlib import Path
 random.seed(10)
 print("BEGIN PROGRAM")
 train_set_og, eval_set_og = arckit.load_data()
-no_thinking = 1
-thinking = 0
+no_thinking = 0
+thinking = 1
 long_thinking = 0
 def sources_split(root_dir: str):
     random.seed(10)
@@ -31,7 +31,7 @@ def sources_split(root_dir: str):
         if chunk_files:
             subdirs.append(str(subdir.name))
 
-    train_indices = random.sample(range(400), 350)
+    train_indices = random.sample(range(400), 320)
     val_indices = [i for i in range(400) if i not in train_indices]
 
     train_sources = [subdirs[i] for i in train_indices]
@@ -39,15 +39,12 @@ def sources_split(root_dir: str):
 
     return train_sources, val_sources
 
-train_sources, val_sources = sources_split("/gpfs/data/oermannlab/users/im2178/lingua/sources")
-
-print(val_sources)
-
-print(train_sources[0])
+train_sources, val_sources = sources_split("/gpfs/data/oermannlab/users/im2178/nanoGPT/sources_10k")
+print(train_sources[:5])
 
 prompts = []
 responses = []
-for t in train_sources:
+for t in val_sources:
     task = train_set_og[t]
     all_ex = task.train + task.test
     prompt = 'B'
@@ -72,11 +69,7 @@ for t in train_sources:
     responses.append(output_str + 'F')
 
 # -----------------------------------------------------------------------------
-init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'source_0_no_thinking/1'# 'icl_no_thinking' # #'out-arc-char-8l_8h_02_3e-5new' # ignored if init_from is not 'resume'
-index_prompt = 0
-start = prompts[index_prompt] + '' # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-num_samples = 10 # number of samples to draw
+num_samples = 50 # number of samples to draw
 max_new_tokens = 5000 # number of tokens generated in each sample
 temperature = 1 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
 top_k = 10 # retain only the top_k most likely tokens, clamp others to have 0 probability
@@ -95,27 +88,20 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# model
-if init_from == 'resume':
-    # init from a model saved in a specific directory
-    ckpt_path = os.path.join(out_dir, 'ckpt_10000.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    gptconf = GPTConfig(**checkpoint['model_args'])
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-elif init_from.startswith('gpt2'):
-    # init from a given GPT-2 model
-    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
-
-model.eval()
-model.to(device)
-if compile:
-    model = torch.compile(model) # requires PyTorch 2.0 (optional)
+def write_to_csv(filename, start, responses, index_prompt, samples_list):
+    data = [[start, responses[index_prompt]] + samples_list]
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    # Open the CSV file for writing (will overwrite if it already exists)
+    with open(filename, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        
+        # Write the header row: one start, one true_ans, and len samples sample columns
+        header = ['start', 'true_ans'] + [f'sample_{i}' for i in range(len(samples_list))]
+        writer.writerow(header)
+        
+        # Write each row of data (start, true_ans, and 10 samples)
+        for row in data:
+            writer.writerow(row)
 
 
 meta_path = 'data/arc/meta.pkl'
@@ -126,204 +112,94 @@ stoi, itos = meta['stoi'], meta['itos']
 encode = lambda s: [stoi[c] for c in s]
 decode = lambda l: ''.join([itos[i] for i in l])
 
-# encode the beginning of the prompt
-if start.startswith('FILE:'):
-    with open(start[5:], 'r', encoding='utf-8') as f:
-        start = f.read()
-start_ids = encode(start)
-x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+if no_thinking:
+    # out_dirs = ['no_thinking/five_sources/size3/2/ckpt_40000.pt']
+    # out_dirs = ['no_thinking/five_sources/size2/1/ckpt_19000.pt']
+    # out_dirs = ['no_thinking/source_0/size1/3/ckpt_15000.pt', 'no_thinking/source_0/size2/1/ckpt_21000.pt', 
+    #             'no_thinking/source_1/size1/3/ckpt_23000.pt', 'no_thinking/source_1/size2/1/ckpt_29000.pt', 
+    #             'no_thinking/source_2/size1/3/ckpt_24000.pt', 'no_thinking/source_2/size2/2/ckpt_12000.pt', 
+    #             'no_thinking/source_3/size1/5/ckpt_10000.pt', 'no_thinking/source_3/size2/2/ckpt_16000.pt', 
+    #             'no_thinking/source_4/size1/2/ckpt_29000.pt', 'no_thinking/source_4/size2/5/ckpt_20000.pt']
 
-print(start)
-print("true ans:")
-print(responses[index_prompt])
-print('---------------\n')
-# run generation
-# with torch.no_grad():
-#     with ctx:
-#         for k in range(num_samples):
-#             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-#             print(decode(y[0].tolist()))
-#             print('---------------')
-samples_list = []
-import csv
+    out_dirs = [# 'no_thinking/ten_sources/size3/1/ckpt_43000.pt', 
+                # 'no_thinking/twenty_sources/size3/1/ckpt_85000.pt', # 2
+                # 'no_thinking/forty_sources/size3/1/ckpt_66000.pt', # 2
+                # 'no_thinking/eighty_sources/size3/1/ckpt_6000.pt',
+                # 'no_thinking/onesixty_sources/size3/1/ckpt_8000.pt',
+                'no_thinking/threetwenty_sources/size3/1/ckpt_63000.pt' # running 3
+                ]
 
-def write_to_csv(filename, data):
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-    # Open the CSV file for writing (will overwrite if it already exists)
-    with open(filename, mode='w', newline='') as file:
-        writer = csv.writer(file)
-        
-        # Write the header row: one start, one true_ans, and 10 sample columns
-        header = ['start', 'true_ans'] + [f'sample_{i}' for i in range(10)]
-        writer.writerow(header)
-        
-        # Write each row of data (start, true_ans, and 10 samples)
-        for row in data:
-            writer.writerow(row)
 
-with torch.no_grad():
-    with ctx:
-        for k in range(num_samples):
-            x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-            output_tokens = []  # To store generated tokens
-            while True:
-                y = model.generate(x, 1, temperature=temperature, top_k=top_k)  # Generate one token
-                token = y[0, -1].item()  # Get the last generated token
-                output_tokens.append(token)  # Append the token to the output list
+elif thinking:
+    # out_dirs = ['thinking/five_sources/size3/2/ckpt_13000.pt']
+    # out_dirs = ['thinking/five_sources/size2/2/ckpt_19000.pt']
+    # out_dirs = ['thinking/source_0/size1/3/ckpt_49000.pt', 'thinking/source_0/size2/4/ckpt_22000.pt', 
+    #             'thinking/source_1/size1/5/ckpt_16000.pt', 'thinking/source_1/size2/5/ckpt_34000.pt', 
+    #             'thinking/source_2/size1/4/ckpt_29000.pt', 'thinking/source_2/size2/3/ckpt_18000.pt', 
+    #             'thinking/source_3/size1/5/ckpt_24000.pt', 'thinking/source_3/size2/3/ckpt_13000.pt', 
+    #             'thinking/source_4/size1/2/ckpt_48000.pt', 'thinking/source_4/size2/5/ckpt_18000.pt']
 
-                # Check if the token is 'F' (ensure you encode 'F' properly)
-                if token == stoi['F']:  # or however you access the index for 'F'
-                    break
+    out_dirs = [# ' thinking/ten_sources/size3/1/ckpt_23000.pt',
+                #'thinking/twenty_sources/size3/1/ckpt_33000.pt',
+                # 'thinking/forty_sources/size3/1/ckpt_8000.pt',
+                # 'thinking/eighty_sources/size3/1/ckpt_13000.pt',
+                # 'thinking/onesixty_sources/size3/1/ckpt_9000.pt',
+                'thinking/threetwenty_sources/size3/1/ckpt_20000.pt' # running 2
+                ]
 
-                if len(output_tokens) > 4096:
-                    break
+for dir in out_dirs:
+    # model
+    print(dir)
+    checkpoint = torch.load(dir, map_location=device)
+    gptconf = GPTConfig(**checkpoint['model_args'])
+    model = GPT(gptconf)
+    state_dict = checkpoint['model']
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.load_state_dict(state_dict)
+    model.eval()
+    model.to(device)
+    if compile:
+        model = torch.compile(model) # requires PyTorch 2.0 (optional)
 
-                # Optionally update x with the new token to continue generation
-                x = torch.cat([x, y[:, -1:]], dim=1)  # Append the new token to the input
+    # source
+    # index_prompt = (int)(dir[dir.find('/', dir.find('/') + 1) - 1])
+    for index_prompt in range(80):
+        samples_list = []
+        start = prompts[index_prompt]
+        start_ids = encode(start)
+        x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+        print('prompt: ', start)
+        print('true ans: ', responses[index_prompt])
 
-            # Decode the generated tokens
-            generated_output = decode(output_tokens)
-            print(generated_output)
-            print('---------------')
-            samples_list.append(generated_output)
+        with torch.no_grad():
+            with ctx:
+                for k in range(num_samples):
+                    x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+                    output_tokens = []  # To store generated tokens
+                    while True:
+                        y = model.generate(x, 1, temperature=temperature, top_k=top_k)  # Generate one token
+                        token = y[0, -1].item()  # Get the last generated token
+                        output_tokens.append(token)  # Append the token to the output list
 
-data = [[start, responses[index_prompt]] + samples_list]
-write_to_csv('samples_csv/' + ckpt_path[:-3] + '.csv', data)
-# import re
+                        # Check if the token is 'F' (ensure you encode 'F' properly)
+                        if token == stoi['F']:  # or however you access the index for 'F'
+                            break
 
-# def parse_matrix(input_str):
-#     """
-#     Parse the input matrix string into a list of lists (2D matrix).
-#     """
-#     # Remove outer square brackets and split the string by '][' to get individual rows
-#     input_str = input_str.strip('[]')
-#     rows = input_str.split('][')
-    
-#     # Convert each row into integers and store in a list of lists
-#     matrix = [list(map(int, list(row))) for row in rows]
-    
-#     return matrix
+                        if len(output_tokens) > 4096:
+                            break
 
-# def is_matrix(matrix):
-#     """
-#     Check if the input is a valid matrix (list of lists) with rows of equal length.
-#     """
-#     if isinstance(matrix, list) and all(isinstance(row, list) for row in matrix):
-#         row_lengths = [len(row) for row in matrix]
-#         if len(set(row_lengths)) == 1:  # All rows have the same length
-#             return True
-#     return False
+                        # Optionally update x with the new token to continue generation
+                        x = torch.cat([x, y[:, -1:]], dim=1)  # Append the new token to the input
 
-# def compare_shapes(input_str, true_ans_str):
-#     """
-#     Compare the shapes of two matrix strings by parsing and checking their dimensions.
-#     """
-#     # Parse both input matrices
-#     input_matrix = parse_matrix(input_str)
-#     true_ans_matrix = parse_matrix(true_ans_str)
-    
-#     # Check if both are valid matrices
-#     if not is_matrix(input_matrix):
-#         return False, "Input matrix is not valid"
-    
-#     if not is_matrix(true_ans_matrix):
-#         return False, "Reference matrix (true_ans) is not valid"
-    
-#     # Get shapes (number of rows and columns)
-#     input_shape = (len(input_matrix), len(input_matrix[0]))
-#     true_ans_shape = (len(true_ans_matrix), len(true_ans_matrix[0]))
-    
-#     # Compare the shapes
-#     if input_shape == true_ans_shape:
-#         return True
-#     else:
-#         return False
+                    # Decode the generated tokens
+                    generated_output = decode(output_tokens)
+                    print(generated_output)
+                    samples_list.append(generated_output)
+                    if generated_output == responses[index_prompt]:
+                        print("FOUND")
+                        break
 
-# # # Example input string and true_ans string
-# # input_str = "[[7700000707007][7701002077007][6666666666666][6666666666666][7777700000707][7777702077700][7777702077070][7770702077007][0777770777077]]"
-# # true_ans_str = "[[1][2][3]]"  # Example of another matrix in string form
-
-# # # Compare the shapes of both matrices
-# # result, message = compare_shapes(input_str, true_ans_str)
-# # print(message)
-
-# total = 0
-# same_length = 0
-# same_shape = 0
-# results = []
-# for p in tqdm(range(len(prompts))):
-#     start = prompts[p]
-#     if start.startswith('FILE:'):
-#         with open(start[5:], 'r', encoding='utf-8') as f:
-#             start = f.read()
-#     start_ids = encode(start)
-#     x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-#     true_ans = responses[p][:-1]
-#     true_length = len(true_ans)
-#     percent_common_chars = 0
-#     prompt_too_long = (len(start) > 4096)
-#     with torch.no_grad():
-#         with ctx:
-#             exact_curr = 0
-#             same_length_curr = 0
-#             max_common_chars = 0
-#             same_shape_curr = 0
-#             closest_ans = ''
-#             exact_ans = ''
-#             for k in range(num_samples):
-#                 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-#                 output_tokens = []  # To store generated tokens
-#                 while True:
-#                     y = model.generate(x, 1, temperature=temperature, top_k=top_k)  # Generate one token
-#                     token = y[0, -1].item()  # Get the last generated token
-#                     output_tokens.append(token)  # Append the token to the output list
-
-#                     # Check if the token is 'F' (ensure you encode 'F' properly)
-#                     if token == stoi['F']:  # or however you access the index for 'F'
-#                         break
-
-#                     if len(output_tokens) > 1000:
-#                         break
-
-#                     # Optionally update x with the new token to continue generation
-#                     x = torch.cat([x, y[:, -1:]], dim=1)  # Append the new token to the input
-
-#                 # Decode the generated tokens
-#                 generated_output = decode(output_tokens)
-#                 generated_ans = generated_output[:-1] # generated_output.rsplit('t', 1)[-1]
-
-#                 if generated_ans == true_ans:
-#                     exact_curr += 1
-#                     same_shape_curr += 1  
-#                     closest_ans = generated_ans
-#                     percent_common_chars = 1
-#                 elif len(generated_ans) == len(true_ans) and exact_curr == 0:
-#                     print(true_ans, generated_ans)
-#                     if compare_shapes(generated_ans, true_ans):
-#                         same_shape_curr += 1  
-#                         common_chars = sum(c1 == c2 for c1, c2 in zip(generated_ans, true_ans))
-#                         if common_chars > max_common_chars:
-#                             max_common_chars = common_chars
-#                             closest_ans = generated_ans
-#                             percent_common_chars = max_common_chars / len(true_ans)
-
-#             if exact_curr > 0:
-#                 total += 1
-#                 results.append((start, true_ans, prompt_too_long, closest_ans, true_length, same_shape_curr > 0, percent_common_chars, 'found'))
-#             elif same_shape_curr:
-#                 same_shape += 1
-#                 results.append((start, true_ans, prompt_too_long, closest_ans, true_length, same_shape_curr > 0, percent_common_chars, ''))
-#             else:
-#                 results.append((start, true_ans, prompt_too_long, closest_ans, true_length, same_shape_curr > 0, percent_common_chars, ''))
-
-# print('number of prompts', len(prompts))
-# print('exact sol found', total)
-# print('same shape sol found', same_shape)
-
-# csv_file = "results_icl_10k_valset.csv"
-# with open(csv_file, mode='w', newline='') as file:
-#     writer = csv.writer(file)
-#     # Write the header
-#     writer.writerow(["input_prompt", "true_ans", "prompt_too_long", "closest_ans", "true length", "is same shape", "percent common char", "exact solution found"])
-#     # Write the data rows
-#     writer.writerows(results)
+        write_to_csv('samples_csv/' + str(index_prompt) + '/' + dir[:-3] + '.csv', start, responses, index_prompt, samples_list)

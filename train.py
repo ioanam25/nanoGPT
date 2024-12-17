@@ -34,7 +34,7 @@ from pathlib import Path
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-curr_source = 4
+max_sources = 0
 no_thinking = 0
 thinking = 0
 long_thinking = 0
@@ -144,7 +144,7 @@ def sources_split(root_dir: str):
         if chunk_files:
             subdirs.append(str(chunk_files[0]))
 
-    train_indices = random.sample(range(400), 350)
+    train_indices = random.sample(range(400), 320)
     val_indices = [i for i in range(400) if i not in train_indices]
 
     train_sources = [subdirs[i] for i in train_indices]
@@ -182,23 +182,27 @@ def sample_and_combine_lines(lines: list, rng: np.random.Generator) -> dict:
 
 def get_batch(split):
     # print("in get batch")
+    rng = np.random.default_rng()
     if split == 'train':
-        sources = train_sources # random.choice(train_sources)
+        sources = train_sources 
+        curr_source = rng.integers(0, max_sources)
         source = sources[curr_source]
         lines = read_jsonl_block(source)[:9000]
-    else:
-        sources = train_sources # random.choice(val_sources)
+    elif split == 'val_train': # val on seen tasks
+        sources = train_sources 
+        curr_source = rng.integers(0, max_sources)
         source = sources[curr_source]
         lines = read_jsonl_block(source)[9000:]
-    # source = sources[0] # random.choice(sources)
-    # print("SOURCE", source)
-    # lines = read_jsonl_block(source)
-    rng = np.random.default_rng()
+    elif split == 'val_test': # new val tasks unseen
+        sources = val_sources 
+        curr_source = rng.integers(0, 80)
+        source = sources[curr_source]
+        lines = read_jsonl_block(source)[:1000]
+
     ans_lines = rng.choice(lines, size=batch_size, replace=False) #random.randint(1000, (batch_size, ))
     x = []
     y = []
-    # print("we have ans lines", len(ans_lines))
-    # print(block_size)
+
     for line in ans_lines: # we fill batch
         full_task = 'P' * (block_size + 1)
         while len(full_task) > block_size:
@@ -210,31 +214,22 @@ def get_batch(split):
                 full_task = prompt_lines + 't' * (int)(np.log(len(prompt_lines))) + line["text"] + 'F'
             elif long_thinking:
                 full_task = prompt_lines + 't' * (len(prompt_lines) // 3) + line["text"] + 'F'
-            # print(len(full_task))
 
-        # print("exit while 1")
-        # print("full task before padding", full_task)
         while len(full_task) < block_size:
-            # print("enter while 2")
             full_task += 'P'
-        # print(print("exit while 2"))
         x.append(torch.tensor(encode(full_task))) # x = ....ansPPPP y = PPPPansPPP
-        # print(line['text'])
         if no_thinking:
             target = 'P' * (len(prompt_lines) - 1 ) + line['text'] + 'F'
         elif thinking:
             target = 'P' * (len(prompt_lines) - 1 + (int)(np.log(len(prompt_lines)))) + line['text'] + 'F'
         elif long_thinking:
             target = 'P' * (len(prompt_lines) - 1 + (len(prompt_lines) // 3)) + line['text'] + 'F'
-        # print("target before padding", target)
         while len(target) < block_size:
             target += 'P'
         y.append(torch.tensor(encode(target)))
     
-    # print("time to stack")
     x = torch.stack(x)
     y = torch.stack(y)
-    # print(x.shape, y.shape)
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -245,6 +240,7 @@ def get_batch(split):
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0 # 0
 best_val_loss = 1e9 #1e9
+best_iter = 0
 
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -328,7 +324,7 @@ if ddp:
 def estimate_loss():
     out = {}
     model.eval()
-    for split in ['train', 'val']:
+    for split in ['train', 'val_train', 'val_test']:
         losses = torch.zeros(eval_iters)
         # print("eval iters", eval_iters)
         for k in range(eval_iters):
@@ -361,7 +357,7 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
-early_stopping_patience = 10  # Number of steps to wait for improvement
+early_stopping_patience = 100  # Number of steps to wait for improvement
 early_stopping_min_delta = 1e-3  # Minimum change in loss to count as an improvement
 early_stopping_counter = 0  # Counter to track how many steps since last improvement
 
@@ -384,32 +380,34 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        # print("in eval")
         losses = estimate_loss()
-        # print("estimated loss")
-        # print(losses)
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val_train']:.4f}, test loss {losses['val_test']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
-                "val/loss": losses['val'],
+                "val/loss": losses['val_train'],
+                "test/loss": losses['val_test'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
+
         print(f"Iter: {iter_num}, "
           f"Train Loss: {losses['train']:.4f}, "
-          f"Val Loss: {losses['val']:.4f}, "
+          f"Val Loss: {losses['val_train']:.4f}, "
+          f"Test Loss: {losses['val_test']:.4f}, "
           f"Learning Rate: {lr:.6e}, "
           f"MFU: {running_mfu * 100:.2f}%")
         
         train_loss = losses['train']
-        val_loss = losses['val']
+        val_loss = losses['val_train']
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         if val_loss < best_val_loss - early_stopping_min_delta:
             best_val_loss = val_loss
             early_stopping_counter = 0 
+            best_iter = iter_num
 
             if val_loss < best_val_loss or always_save_checkpoint:
                 if iter_num > 0:
@@ -430,10 +428,14 @@ while True:
             print(f"Early stopping triggered at iteration {iter_num} due to no improvement in validation loss.")
             np.save(out_dir + '/train_losses.npy', train_losses)
             np.save(out_dir + '/val_losses.npy', val_losses)
+            print("ITER", best_iter)
+            print("BEST LOSS", best_val_loss)
             break
     if iter_num == 0 and eval_only:
         np.save(out_dir + '/train_losses.npy', train_losses)
         np.save(out_dir + '/val_losses.npy', val_losses)
+        print("ITER", best_iter)
+        print("BEST LOSS", best_val_loss)
         break
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
@@ -482,6 +484,10 @@ while True:
 
     # termination conditions
     if iter_num > max_iters:
+        np.save(out_dir + '/train_losses.npy', train_losses)
+        np.save(out_dir + '/val_losses.npy', val_losses)
+        print("ITER", best_iter)
+        print("BEST LOSS", best_val_loss)
         break
 
 if ddp:
